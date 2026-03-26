@@ -1,0 +1,539 @@
+"""
+Flight Booking Agent System (google-genai SDK)
+===============================================
+Uses the NEW `google.genai` package with function calling.
+
+Install:
+  pip install google-genai
+
+Run:
+AGENT.py
+"""
+
+from google import genai
+from google.genai import types
+import json
+import uuid
+import random
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# SET YOUR GEMINI API KEY HERE
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = "AIzaSyBrzblG4KPUKiWwCwiLjgQcgAw1GH7j4I8"  # <-- replace this
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL  = "gemini-1.5-flash"   # current stable model
+
+# ---------------------------------------------------------------------------
+# Shared booking state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BookingState:
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+    departure_date: Optional[str] = None
+    return_date: Optional[str] = None
+    num_passengers: int = 1
+    cabin_class: str = "economy"
+    selected_flight: Optional[dict] = None
+    pnr: Optional[str] = None
+    payment_status: Optional[str] = None
+    total_charged: Optional[float] = None
+    confirmation_sent: bool = False
+    errors: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Mock external services
+# ---------------------------------------------------------------------------
+
+MOCK_FLIGHTS_DB = [
+    {"flight_id": "AI101", "airline": "Air India",  "origin": "DEL", "destination": "JFK",
+     "departure": "08:00", "arrival": "14:30+1", "duration": "14h 30m",
+     "price_usd": 780, "seats_available": 12, "stops": 0},
+    {"flight_id": "UA789", "airline": "United",     "origin": "DEL", "destination": "JFK",
+     "departure": "23:45", "arrival": "06:10+2", "duration": "16h 25m",
+     "price_usd": 640, "seats_available": 5,  "stops": 1},
+    {"flight_id": "EK212", "airline": "Emirates",   "origin": "DEL", "destination": "JFK",
+     "departure": "03:35", "arrival": "11:55+1", "duration": "16h 20m",
+     "price_usd": 920, "seats_available": 8,  "stops": 1},
+    {"flight_id": "LH756", "airline": "Lufthansa",  "origin": "DEL", "destination": "JFK",
+     "departure": "14:15", "arrival": "23:45+1", "duration": "17h 30m",
+     "price_usd": 710, "seats_available": 20, "stops": 1},
+]
+
+
+def mock_search_flights(origin, destination, date, num_passengers, cabin_class):
+    multiplier = {"economy": 1.0, "business": 3.2, "first": 5.5}.get(cabin_class, 1.0)
+    results = []
+    for f in MOCK_FLIGHTS_DB:
+        if (f["origin"].upper() == origin.upper() and
+                f["destination"].upper() == destination.upper() and
+                f["seats_available"] >= int(num_passengers)):
+            flight = f.copy()
+            flight["price_usd"] = round(f["price_usd"] * multiplier * int(num_passengers), 2)
+            flight["date"] = date
+            results.append(flight)
+    return results
+
+
+def mock_create_booking(flight_id, date, passengers, cabin_class):
+    pnr = "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=6))
+    if isinstance(passengers, str):
+        passengers = json.loads(passengers)
+    return {
+        "pnr": pnr,
+        "flight_id": flight_id,
+        "date": date,
+        "cabin_class": cabin_class,
+        "passengers": passengers,
+        "status": "confirmed",
+        "booked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def mock_process_payment(pnr, amount_usd, card_last4="4242"):
+    charge_id = "ch_" + uuid.uuid4().hex[:16]
+    return {
+        "charge_id": charge_id,
+        "pnr": pnr,
+        "amount_usd": amount_usd,
+        "card_last4": card_last4,
+        "status": "succeeded",
+        "charged_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def mock_send_notification(pnr, email, phone, booking_details):
+    if isinstance(booking_details, str):
+        booking_details = json.loads(booking_details)
+    print(f"\n  [EMAIL] -> {email}")
+    print(f"  Subject: Booking Confirmed - PNR {pnr}")
+    print(f"  Flight {booking_details['flight_id']} on {booking_details['date']}")
+    print(f"  Passengers: {len(booking_details['passengers'])}")
+    print(f"\n  [SMS] -> {phone}: Flight {booking_details['flight_id']} confirmed. PNR: {pnr}")
+    return {"email_sent": True, "sms_sent": True, "pnr": pnr}
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatcher  (maps function name -> mock implementation)
+# ---------------------------------------------------------------------------
+
+def dispatch_tool(fn_name: str, fn_args: dict) -> dict:
+    if fn_name == "parse_travel_request":
+        return {"status": "parsed", **fn_args}
+    elif fn_name == "search_flights":
+        flights = mock_search_flights(**fn_args)
+        return {"flights": flights, "count": len(flights)}
+    elif fn_name == "create_booking":
+        return mock_create_booking(**fn_args)
+    elif fn_name == "process_payment":
+        return mock_process_payment(**fn_args)
+    elif fn_name == "send_notification":
+        return mock_send_notification(**fn_args)
+    return {"error": f"Unknown function: {fn_name}"}
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas  (new google.genai style)
+# ---------------------------------------------------------------------------
+
+PARSE_TRAVEL_REQUEST = types.FunctionDeclaration(
+    name="parse_travel_request",
+    description="Extract structured travel parameters from a natural language booking request.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "origin":         types.Schema(type=types.Type.STRING, description="IATA airport code e.g. DEL"),
+            "destination":    types.Schema(type=types.Type.STRING, description="IATA airport code e.g. JFK"),
+            "departure_date": types.Schema(type=types.Type.STRING, description="YYYY-MM-DD"),
+            "return_date":    types.Schema(type=types.Type.STRING, description="YYYY-MM-DD or empty string for one-way"),
+            "num_passengers": types.Schema(type=types.Type.INTEGER, description="Number of passengers"),
+            "cabin_class":    types.Schema(type=types.Type.STRING, description="economy, business, or first"),
+        },
+        required=["origin", "destination", "departure_date", "num_passengers", "cabin_class"],
+    ),
+)
+
+SEARCH_FLIGHTS = types.FunctionDeclaration(
+    name="search_flights",
+    description="Search available flights between two airports on a given date.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "origin":         types.Schema(type=types.Type.STRING, description="IATA code e.g. DEL"),
+            "destination":    types.Schema(type=types.Type.STRING, description="IATA code e.g. JFK"),
+            "date":           types.Schema(type=types.Type.STRING, description="YYYY-MM-DD"),
+            "num_passengers": types.Schema(type=types.Type.INTEGER),
+            "cabin_class":    types.Schema(type=types.Type.STRING, description="economy, business, or first"),
+        },
+        required=["origin", "destination", "date", "num_passengers", "cabin_class"],
+    ),
+)
+
+CREATE_BOOKING = types.FunctionDeclaration(
+    name="create_booking",
+    description="Reserve seats for a flight and get a PNR booking reference.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "flight_id":   types.Schema(type=types.Type.STRING),
+            "date":        types.Schema(type=types.Type.STRING, description="YYYY-MM-DD"),
+            "cabin_class": types.Schema(type=types.Type.STRING),
+            "passengers":  types.Schema(type=types.Type.STRING,
+                           description='JSON string list e.g. [{"name":"...","passport":"...","dob":"..."}]'),
+        },
+        required=["flight_id", "date", "cabin_class", "passengers"],
+    ),
+)
+
+PROCESS_PAYMENT = types.FunctionDeclaration(
+    name="process_payment",
+    description="Charge the customer's card for a confirmed booking.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "pnr":        types.Schema(type=types.Type.STRING, description="Booking reference"),
+            "amount_usd": types.Schema(type=types.Type.NUMBER),
+            "card_last4": types.Schema(type=types.Type.STRING, description="Last 4 digits of card"),
+        },
+        required=["pnr", "amount_usd", "card_last4"],
+    ),
+)
+
+SEND_NOTIFICATION = types.FunctionDeclaration(
+    name="send_notification",
+    description="Send email and SMS booking confirmation to the passenger.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "pnr":             types.Schema(type=types.Type.STRING),
+            "email":           types.Schema(type=types.Type.STRING),
+            "phone":           types.Schema(type=types.Type.STRING),
+            "booking_details": types.Schema(type=types.Type.STRING,
+                               description="JSON string of booking details"),
+        },
+        required=["pnr", "email", "phone", "booking_details"],
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Base agent  (new google.genai agentic loop)
+# ---------------------------------------------------------------------------
+
+class BaseAgent:
+    def __init__(self, name: str, system_prompt: str, tool_declarations: list):
+        self.name = name
+        self.system_prompt = system_prompt
+        self.tools = [types.Tool(function_declarations=tool_declarations)]
+        self.config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            tools=self.tools,
+        )
+
+    def run(self, user_message: str) -> tuple:
+        """
+        Agentic loop using the new SDK.
+        Returns (final_text, last_function_args).
+        """
+        print(f"\n{'-'*60}")
+        print(f"Agent : {self.name}")
+        print(f"Input : {user_message[:120]}")
+        print(f"{'-'*60}")
+
+        contents = [types.Content(role="user", parts=[types.Part(text=user_message)])]
+        last_fn_args = {}
+
+        while True:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                config=self.config,
+            )
+
+            # Append model response to history
+            contents.append(
+                types.Content(role="model", parts=response.candidates[0].content.parts)
+            )
+
+            # Collect any function calls
+            fn_calls = [
+                p.function_call
+                for p in response.candidates[0].content.parts
+                if p.function_call is not None
+            ]
+
+            if not fn_calls:
+                # No more function calls — return final text
+                text = response.text or ""
+                if text:
+                    print(f"  [{self.name}]: {text[:200]}")
+                return text, last_fn_args
+
+            # Execute each function call and build responses
+            fn_response_parts = []
+            for fn_call in fn_calls:
+                fn_name = fn_call.name
+                fn_args = dict(fn_call.args)
+                last_fn_args = fn_args
+
+                print(f"  -> Tool: {fn_name}  args: {json.dumps(fn_args)[:120]}")
+                result = dispatch_tool(fn_name, fn_args)
+                print(f"  <- Result: {json.dumps(result)[:200]}")
+
+                fn_response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=fn_name,
+                            response={"result": result},
+                        )
+                    )
+                )
+
+            # Feed all function responses back
+            contents.append(types.Content(role="user", parts=fn_response_parts))
+
+
+# ---------------------------------------------------------------------------
+# Specialized agents
+# ---------------------------------------------------------------------------
+
+class OrchestratorAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            name="Orchestrator",
+            system_prompt=(
+                "You are a travel request parser. "
+                "Use the parse_travel_request function to extract structured travel "
+                "parameters from any natural-language request. Always call the function."
+            ),
+            tool_declarations=[PARSE_TRAVEL_REQUEST],
+        )
+
+    def parse_request(self, user_input: str) -> dict:
+        _, fn_args = self.run(user_input)
+        return fn_args
+
+
+class SearchAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            name="SearchAgent",
+            system_prompt=(
+                "You are a flight search agent. Use the search_flights function "
+                "to find available options. Always call the function — never invent data."
+            ),
+            tool_declarations=[SEARCH_FLIGHTS],
+        )
+
+    def search(self, origin, destination, date, num_passengers, cabin_class) -> list:
+        prompt = (
+            f"Search flights from {origin} to {destination} on {date} "
+            f"for {num_passengers} passenger(s) in {cabin_class} class."
+        )
+        _, fn_args = self.run(prompt)
+        return mock_search_flights(
+            origin=fn_args.get("origin", origin),
+            destination=fn_args.get("destination", destination),
+            date=fn_args.get("date", date),
+            num_passengers=fn_args.get("num_passengers", num_passengers),
+            cabin_class=fn_args.get("cabin_class", cabin_class),
+        )
+
+
+class BookingAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            name="BookingAgent",
+            system_prompt=(
+                "You are a flight booking agent. Use the create_booking function "
+                "to reserve seats. Pass passengers as a JSON string."
+            ),
+            tool_declarations=[CREATE_BOOKING],
+        )
+
+    def book(self, flight: dict, passengers: list, cabin_class: str) -> dict:
+        prompt = (
+            f"Book flight {flight['flight_id']} on {flight['date']} "
+            f"in {cabin_class} class for passengers: {json.dumps(passengers)}"
+        )
+        _, fn_args = self.run(prompt)
+        return mock_create_booking(
+            flight_id=fn_args.get("flight_id", flight["flight_id"]),
+            date=fn_args.get("date", flight["date"]),
+            cabin_class=fn_args.get("cabin_class", cabin_class),
+            passengers=fn_args.get("passengers", json.dumps(passengers)),
+        )
+
+
+class PaymentAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            name="PaymentAgent",
+            system_prompt=(
+                "You are a payment processing agent. Use the process_payment function "
+                "to charge the customer. Never process without a valid PNR."
+            ),
+            tool_declarations=[PROCESS_PAYMENT],
+        )
+
+    def charge(self, pnr: str, amount_usd: float, card_last4: str = "4242") -> dict:
+        prompt = (
+            f"Process payment for PNR {pnr}. "
+            f"Amount: USD {amount_usd:.2f}. Card ending: {card_last4}."
+        )
+        _, fn_args = self.run(prompt)
+        return mock_process_payment(
+            pnr=fn_args.get("pnr", pnr),
+            amount_usd=fn_args.get("amount_usd", amount_usd),
+            card_last4=fn_args.get("card_last4", card_last4),
+        )
+
+
+class NotificationAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            name="NotificationAgent",
+            system_prompt=(
+                "You are a notification agent. Use the send_notification function "
+                "to send a booking confirmation email and SMS. "
+                "Pass booking_details as a JSON string."
+            ),
+            tool_declarations=[SEND_NOTIFICATION],
+        )
+
+    def notify(self, pnr: str, email: str, phone: str, booking_details: dict) -> dict:
+        prompt = (
+            f"Send booking confirmation for PNR {pnr} to {email} / {phone}. "
+            f"Booking details: {json.dumps(booking_details)}"
+        )
+        _, fn_args = self.run(prompt)
+        details = fn_args.get("booking_details", json.dumps(booking_details))
+        if isinstance(details, str):
+            details = json.loads(details)
+        return mock_send_notification(
+            pnr=fn_args.get("pnr", pnr),
+            email=fn_args.get("email", email),
+            phone=fn_args.get("phone", phone),
+            booking_details=details,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main orchestration pipeline
+# ---------------------------------------------------------------------------
+
+def run_booking_pipeline(user_request: str, passenger_details: list,
+                         contact_email: str, contact_phone: str,
+                         card_last4: str = "4242") -> BookingState:
+
+    state = BookingState()
+    print(f"\n{'='*60}")
+    print(f"  FLIGHT BOOKING SYSTEM  |  Session: {state.session_id}")
+    print(f"{'='*60}")
+    print(f"  Request: {user_request}")
+
+    # -- Step 1: Parse intent ------------------------------------------
+    print("\n[STEP 1] Parsing travel request...")
+    parsed = OrchestratorAgent().parse_request(user_request)
+
+    if not parsed:
+        state.errors.append("Failed to parse travel request")
+        return state
+
+    state.origin         = parsed.get("origin", "").upper()
+    state.destination    = parsed.get("destination", "").upper()
+    state.departure_date = parsed.get("departure_date")
+    state.return_date    = parsed.get("return_date", "")
+    state.num_passengers = int(parsed.get("num_passengers", 1))
+    state.cabin_class    = parsed.get("cabin_class", "economy")
+
+    print(f"\n  Parsed: {state.origin} -> {state.destination} | "
+          f"{state.departure_date} | {state.num_passengers} pax | {state.cabin_class}")
+
+    # -- Step 2: Search flights ----------------------------------------
+    print("\n[STEP 2] Searching flights...")
+    flights = SearchAgent().search(
+        state.origin, state.destination,
+        state.departure_date, state.num_passengers, state.cabin_class,
+    )
+
+    if not flights:
+        state.errors.append(f"No flights found from {state.origin} to {state.destination}")
+        print("  No flights found.")
+        return state
+
+    print(f"\n  Found {len(flights)} flight(s):")
+    for i, f in enumerate(flights, 1):
+        print(f"  [{i}] {f['airline']} {f['flight_id']} | "
+              f"{f['departure']}->{f['arrival']} | {f['duration']} | "
+              f"USD {f['price_usd']} | {f['stops']} stop(s)")
+
+    state.selected_flight = min(flights, key=lambda x: x["price_usd"])
+    print(f"\n  Auto-selected: {state.selected_flight['airline']} "
+          f"{state.selected_flight['flight_id']} (USD {state.selected_flight['price_usd']})")
+
+    # -- Step 3: Create booking ----------------------------------------
+    print("\n[STEP 3] Creating booking...")
+    booking = BookingAgent().book(state.selected_flight, passenger_details, state.cabin_class)
+
+    if not booking.get("pnr"):
+        state.errors.append("Booking creation failed")
+        return state
+
+    state.pnr = booking["pnr"]
+    print(f"\n  PNR created: {state.pnr}")
+
+    # -- Step 4: Process payment ---------------------------------------
+    print("\n[STEP 4] Processing payment...")
+    payment = PaymentAgent().charge(state.pnr, state.selected_flight["price_usd"], card_last4)
+
+    state.payment_status = payment.get("status", "failed")
+    state.total_charged  = payment.get("amount_usd")
+
+    if state.payment_status != "succeeded":
+        state.errors.append(f"Payment failed: {payment}")
+        return state
+
+    print(f"\n  Payment succeeded | Charge: {payment.get('charge_id')} | USD {state.total_charged}")
+
+    # -- Step 5: Send notifications ------------------------------------
+    print("\n[STEP 5] Sending confirmation...")
+    NotificationAgent().notify(
+        pnr=state.pnr,
+        email=contact_email,
+        phone=contact_phone,
+        booking_details={
+            "flight_id":  state.selected_flight["flight_id"],
+            "airline":    state.selected_flight["airline"],
+            "date":       state.departure_date,
+            "departure":  state.selected_flight["departure"],
+            "arrival":    state.selected_flight["arrival"],
+            "cabin":      state.cabin_class,
+            "passengers": passenger_details,
+            "amount_usd": state.total_charged,
+        },
+    )
+    state.confirmation_sent = True
+
+    # -- Summary -------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  BOOKING COMPLETE")
+    print(f"  PNR:        {state.pnr}")
+    print(f"  Flight:     {state.selected_flight['airline']} {state.selected_flight['flight_id']}")
+    print(f"  Route:      {state.origin} -> {state.destination}")
+    print(f"  Date:       {state.departure_date}")
+    print(f"  Cabin:      {state.cabin_class.title()}")
+    print(f"  Passengers: {state.num_passengers}")
+    print(f"  Charged:    USD {state.total_charged}")
+    print(f"  Notified:   {contact_email} / {contact_phone}")
+    print(f"{'='*60}\n")
+
+    return state
+
